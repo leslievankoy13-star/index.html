@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FHIR Patient Dashboard</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 16px; background:#fafafa; }
+    h1 { margin: 0 0 12px 0; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; }
+    .card { background:white; border:1px solid #ddd; border-radius:10px; padding:12px; flex:1; min-width:280px; }
+    label { font-weight:600; }
+    input, select, button { padding:10px; border-radius:8px; border:1px solid #bbb; }
+    button { background:#111; color:white; border:none; cursor:pointer; }
+    button:disabled { opacity:.6; cursor:not-allowed; }
+    table { width:100%; border-collapse:collapse; font-size:14px; }
+    th, td { border-bottom:1px solid #eee; padding:8px; text-align:left; vertical-align:top; }
+    th { background:#f6f6f6; }
+    .muted { color:#666; font-size:13px; }
+    .pill { display:inline-block; padding:4px 8px; border-radius:999px; background:#eef; font-size:12px; }
+    .error { color:#b00020; font-weight:600; }
+    .ok { color:#0a7; font-weight:600; }
+    .small { font-size:12px; }
+    .spacer { height: 8px; }
+  </style>
+</head>
+<body>
+  <h1>FHIR Patient Dashboard</h1>
+  <div class="muted">
+    Data source: <span class="pill" id="serverPill"></span>
+  </div>
+  <div class="spacer"></div>
+
+  <div class="card">
+    <div class="row">
+      <div style="flex:2; min-width:260px;">
+        <label for="name">Patient search (name)</label><br/>
+        <input id="name" placeholder="Example: smith" style="width:100%;" />
+        <div class="muted small">Uses: <code>/Patient?name=...</code></div>
+      </div>
+
+      <div style="flex:1; min-width:260px;">
+        <label for="patientSelect">Select patient</label><br/>
+        <select id="patientSelect" style="width:100%;">
+          <option value="">— Search first —</option>
+        </select>
+        <div class="muted small">Loads patient-linked resources when selected.</div>
+      </div>
+
+      <div style="display:flex; align-items:flex-end; gap:8px;">
+        <button id="searchBtn">Search</button>
+        <button id="loadBtn" disabled>Load Dashboard</button>
+      </div>
+    </div>
+
+    <div class="spacer"></div>
+    <div id="status" class="muted"></div>
+  </div>
+
+  <div class="spacer"></div>
+
+  <div class="row">
+    <div class="card" style="flex:1;">
+      <h3 style="margin-top:0;">Patient Summary</h3>
+      <div id="patientSummary" class="muted">Search and select a patient.</div>
+    </div>
+
+    <div class="card" style="flex:2;">
+      <h3 style="margin-top:0;">Vitals Trend (Observation)</h3>
+      <div class="muted small">Uses: <code>/Observation?patient=...&category=vital-signs</code></div>
+      <canvas id="vitalsChart" height="110"></canvas>
+      <div id="vitalsNote" class="muted small"></div>
+    </div>
+  </div>
+
+  <div class="spacer"></div>
+
+  <div class="row">
+    <div class="card">
+      <h3 style="margin-top:0;">Encounters</h3>
+      <div class="muted small">Uses: <code>/Encounter?patient=...</code></div>
+      <div id="encounters"></div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0;">Medications (MedicationRequest)</h3>
+      <div class="muted small">Uses: <code>/MedicationRequest?patient=...</code></div>
+      <div id="meds"></div>
+    </div>
+  </div>
+
+<script>
+  // ✅ Public FHIR R4 test server
+  const FHIR_BASE = "https://r4.smarthealthit.org";
+  document.getElementById("serverPill").textContent = FHIR_BASE;
+
+  const elName = document.getElementById("name");
+  const elSearch = document.getElementById("searchBtn");
+  const elSelect = document.getElementById("patientSelect");
+  const elLoad = document.getElementById("loadBtn");
+  const elStatus = document.getElementById("status");
+
+  const elSummary = document.getElementById("patientSummary");
+  const elEnc = document.getElementById("encounters");
+  const elMeds = document.getElementById("meds");
+  const elVitalsNote = document.getElementById("vitalsNote");
+
+  let chart;
+
+  function setStatus(msg, kind="muted") {
+    elStatus.className = kind === "error" ? "error" : (kind === "ok" ? "ok" : "muted");
+    elStatus.textContent = msg;
+  }
+
+  function fmtDate(d) {
+    if (!d) return "";
+    try { return new Date(d).toLocaleDateString(); } catch { return d; }
+  }
+
+  function patientDisplay(p) {
+    const name = (p.name && p.name.length)
+      ? (p.name[0].text || [p.name[0].given?.join(" "), p.name[0].family].filter(Boolean).join(" "))
+      : "(No name)";
+    const gender = p.gender || "";
+    const birth = p.birthDate ? fmtDate(p.birthDate) : "";
+    return `${name}${gender || birth ? " — " : ""}${[gender, birth].filter(Boolean).join(", ")}`;
+  }
+
+  async function fhirGet(path) {
+    const url = FHIR_BASE + path;
+    const res = await fetch(url, { headers: { "Accept": "application/fhir+json" }});
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    return res.json();
+  }
+
+  async function searchPatients() {
+    const q = elName.value.trim();
+    if (!q) return setStatus("Type a name (example: smith).", "error");
+
+    setStatus("Searching patients...");
+    elSelect.innerHTML = `<option value="">Searching...</option>`;
+    elLoad.disabled = true;
+
+    try {
+      const bundle = await fhirGet(`/Patient?name=${encodeURIComponent(q)}&_count=20`);
+      const entries = bundle.entry || [];
+      if (!entries.length) {
+        elSelect.innerHTML = `<option value="">No results</option>`;
+        setStatus("No patients found. Try another name (e.g., smith, john, maria).", "error");
+        return;
+      }
+
+      elSelect.innerHTML = `<option value="">— Select a patient —</option>`;
+      for (const e of entries) {
+        const p = e.resource;
+        const opt = document.createElement("option");
+        opt.value = p.id;
+        opt.textContent = patientDisplay(p);
+        opt.dataset.patientJson = JSON.stringify(p);
+        elSelect.appendChild(opt);
+      }
+      setStatus(`Found ${entries.length} patients. Select one, then click "Load Dashboard".`, "ok");
+    } catch (err) {
+      setStatus(`Patient search failed: ${err.message}`, "error");
+      elSelect.innerHTML = `<option value="">Error</option>`;
+    }
+  }
+
+  function renderPatientSummary(p) {
+    const name = patientDisplay(p).split(" — ")[0];
+    const gender = p.gender || "Unknown";
+    const birth = p.birthDate ? fmtDate(p.birthDate) : "Unknown";
+    const id = p.id || "";
+    const telecom = (p.telecom || []).map(t => `${t.system || ""}: ${t.value || ""}`).filter(s => s.trim() !== ":").join(" | ");
+
+    elSummary.innerHTML = `
+      <div><b>Name:</b> ${name}</div>
+      <div><b>Gender:</b> ${gender}</div>
+      <div><b>DOB:</b> ${birth}</div>
+      <div><b>FHIR Patient ID:</b> <code>${id}</code></div>
+      <div class="muted small">${telecom ? "<b>Contact:</b> " + telecom : ""}</div>
+    `;
+  }
+
+  function renderTable(container, cols, rows) {
+    if (!rows.length) {
+      container.innerHTML = `<div class="muted">No data returned for this patient.</div>`;
+      return;
+    }
+    const thead = `<tr>${cols.map(c => `<th>${c}</th>`).join("")}</tr>`;
+    const tbody = rows.map(r => `<tr>${r.map(cell => `<td>${cell ?? ""}</td>`).join("")}</tr>`).join("");
+    container.innerHTML = `<table>${thead}${tbody}</table>`;
+  }
+
+  async function loadEncounters(patientId) {
+    const bundle = await fhirGet(`/Encounter?patient=${encodeURIComponent(patientId)}&_count=25&_sort=-date`);
+    const entries = bundle.entry || [];
+    const rows = entries.map(e => {
+      const enc = e.resource;
+      const type = (enc.type && enc.type[0]?.text) || enc.class?.display || "";
+      const status = enc.status || "";
+      const period = enc.period ? `${fmtDate(enc.period.start)} - ${fmtDate(enc.period.end)}` : "";
+      return [type, status, period];
+    });
+    renderTable(elEnc, ["Type", "Status", "Period"], rows);
+  }
+
+  async function loadMeds(patientId) {
+    const bundle = await fhirGet(`/MedicationRequest?patient=${encodeURIComponent(patientId)}&_count=25&_sort=-_lastUpdated`);
+    const entries = bundle.entry || [];
+    const rows = entries.map(e => {
+      const m = e.resource;
+      const med = m.medicationCodeableConcept?.text || m.medicationReference?.display || "";
+      const status = m.status || "";
+      const intent = m.intent || "";
+      const authored = m.authoredOn ? fmtDate(m.authoredOn) : "";
+      return [med, status, intent, authored];
+    });
+    renderTable(elMeds, ["Medication", "Status", "Intent", "Authored"], rows);
+  }
+
+  function pickObservationValue(obs) {
+    // Prefer systolic/diastolic for BP, otherwise valueQuantity
+    if (obs.component && obs.component.length) {
+      const syst = obs.component.find(c => c.code?.coding?.some(cd => cd.code === "8480-6"))?.valueQuantity?.value;
+      const dias = obs.component.find(c => c.code?.coding?.some(cd => cd.code === "8462-4"))?.valueQuantity?.value;
+      if (syst != null && dias != null) return { label: "Blood Pressure", value: syst, value2: dias, unit: "mmHg", isBP: true };
+    }
+    if (obs.valueQuantity?.value != null) {
+      const unit = obs.valueQuantity.unit || obs.valueQuantity.code || "";
+      const label = obs.code?.text || "Vital";
+      return { label, value: obs.valueQuantity.value, unit, isBP: false };
+    }
+    return null;
+  }
+
+  async function loadVitalsChart(patientId) {
+    // Pull recent vital signs
+    const bundle = await fhirGet(`/Observation?patient=${encodeURIComponent(patientId)}&category=vital-signs&_count=50&_sort=-date`);
+    const entries = (bundle.entry || []).map(e => e.resource);
+
+    // Build data arrays (most recent last)
+    const points = [];
+    let hasBP = false;
+
+    for (const obs of entries) {
+      const val = pickObservationValue(obs);
+      if (!val) continue;
+      const when = obs.effectiveDateTime || obs.effectivePeriod?.start || obs.issued;
+      if (!when) continue;
+
+      if (val.isBP) {
+        hasBP = true;
+        points.push({ t: new Date(when), syst: val.value, dias: val.value2 });
+      } else {
+        points.push({ t: new Date(when), v: val.value, label: val.label, unit: val.unit });
+      }
+    }
+
+    points.sort((a,b) => a.t - b.t);
+
+    const ctx = document.getElementById("vitalsChart");
+
+    if (chart) chart.destroy();
+
+    if (!points.length) {
+      elVitalsNote.textContent = "No vital-sign observations found for this patient.";
+      chart = new Chart(ctx, {
+        type: "line",
+        data: { labels: [], datasets: [] },
+        options: { responsive: true }
+      });
+      return;
+    }
+
+    if (hasBP) {
+      elVitalsNote.textContent = "Displaying Blood Pressure trend (Systolic & Diastolic) if available.";
+      const labels = points.map(p => p.t.toLocaleDateString());
+      const syst = points.map(p => p.syst ?? null);
+      const dias = points.map(p => p.dias ?? null);
+
+      chart = new Chart(ctx, {
+        type: "line",
+        data: {
+          labels,
+          datasets: [
+            { label: "Systolic (mmHg)", data: syst, spanGaps: true },
+            { label: "Diastolic (mmHg)", data: dias, spanGaps: true }
+          ]
+        },
+        options: { responsive: true }
+      });
+    } else {
+      // fallback: show one generic vital series
+      const labels = points.map(p => p.t.toLocaleDateString());
+      const data = points.map(p => p.v ?? null);
+      const unit = points.find(p => p.unit)?.unit || "";
+      const labelName = points.find(p => p.label)?.label || "Vital";
+
+      elVitalsNote.textContent = `Displaying ${labelName} trend ${unit ? "(" + unit + ")" : ""}.`;
+
+      chart = new Chart(ctx, {
+        type: "line",
+        data: {
+          labels,
+          datasets: [
+            { label: `${labelName} ${unit ? "(" + unit + ")" : ""}`, data, spanGaps: true }
+          ]
+        },
+        options: { responsive: true }
+      });
+    }
+  }
+
+  async function loadDashboard() {
+    const patientId = elSelect.value;
+    if (!patientId) return setStatus("Select a patient first.", "error");
+
+    const opt = elSelect.options[elSelect.selectedIndex];
+    const p = JSON.parse(opt.dataset.patientJson);
+
+    setStatus("Loading patient dashboard...");
+    renderPatientSummary(p);
+
+    try {
+      await Promise.all([
+        loadEncounters(patientId),
+        loadMeds(patientId),
+        loadVitalsChart(patientId)
+      ]);
+      setStatus("Dashboard loaded successfully.", "ok");
+    } catch (err) {
+      setStatus(`Dashboard load failed: ${err.message}`, "error");
+    }
+  }
+
+  elSearch.addEventListener("click", searchPatients);
+  elLoad.addEventListener("click", loadDashboard);
+
+  elSelect.addEventListener("change", () => {
+    elLoad.disabled = !elSelect.value;
+  });
+
+  // allow enter to search
+  elName.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") searchPatients();
+  });
+
+  setStatus("Ready. Search by patient name (example: smith).");
+</script>
+</body>
+</html>
